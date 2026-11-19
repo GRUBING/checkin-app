@@ -212,17 +212,12 @@ def _timeline_card(app) -> ft.Control:
     cells = [app.db.get_checkin(task["id"], start + timedelta(days=i)) for i in range(30)]
     days = [start + timedelta(days=i) for i in range(30)]
 
-    strips: list[ft.Control] = []
-    for chunk_start in (0, 15):
-        strips.append(
-            ft.Row(
-                [
-                    _timeline_cell(app, days[i], cells[i], p, created)
-                    for i in range(chunk_start, chunk_start + 15)
-                ],
-                spacing=6,
-            )
-        )
+    timeline = ft.Row(
+        [_timeline_cell(app, days[i], cells[i], p, created) for i in range(30)],
+        wrap=True,
+        spacing=6,
+        run_spacing=6,
+    )
 
     stats = app.db.task_stats(task["id"], 30)
     counts = stats["counts"]
@@ -249,7 +244,7 @@ def _timeline_card(app) -> ft.Control:
             [
                 section_header("单任务时间线", p, meta),
                 ft.Row([dropdown], spacing=0),
-                ft.Column(strips, spacing=6, tight=True),
+                timeline,
                 ft.Row(chips, wrap=True, spacing=6, run_spacing=6),
             ],
             spacing=12,

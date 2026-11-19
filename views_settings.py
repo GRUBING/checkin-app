@@ -131,18 +131,25 @@ def _reminder_card(app) -> ft.Control:
     enabled = app.db.get_setting("summary_enabled", "0") == "1"
     time_value = app.db.get_setting("summary_time", "21:00") or "21:00"
 
-    time_field = ft.TextField(
-        value=time_value,
-        width=76,
-        text_size=13,
-        text_align=ft.TextAlign.CENTER,
-        content_padding=ft.Padding.symmetric(horizontal=8, vertical=8),
+    time_box = ft.Container(
+        content=ft.Row(
+            [
+                ft.Text(time_value, size=13, weight=ft.FontWeight.W_600,
+                        color=p.text if enabled else p.muted),
+                ft.Icon(ft.Icons.EXPAND_MORE, size=14, color=p.faint),
+            ],
+            spacing=2,
+            tight=True,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+        width=82,
+        height=36,
+        alignment=ft.Alignment.CENTER,
         border_radius=10,
-        border_color=p.line,
-        focused_border_color=p.gold,
-        disabled=not enabled,
-        on_submit=lambda e: app.set_summary_time(e.control.value),
-        on_blur=lambda e: app.set_summary_time(e.control.value),
+        border=ft.Border.all(1, p.line),
+        bgcolor=p.surface_soft if enabled else None,
+        on_click=lambda e: app.pick_summary_time(),
+        tooltip="滑动选择时间",
     )
 
     return card(
@@ -160,7 +167,7 @@ def _reminder_card(app) -> ft.Control:
                             tight=True,
                             expand=True,
                         ),
-                        time_field,
+                        time_box,
                         ft.Switch(value=enabled, active_color=p.gold,
                                   inactive_thumb_color=p.surface,
                                   inactive_track_color=p.line,
@@ -174,8 +181,8 @@ def _reminder_card(app) -> ft.Control:
                         [
                             ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, size=14, color=p.gold),
                             ft.Text(
-                                "提醒设置会保存在本地。系统级推送需要 Android 原生桥接，"
-                                "当前版本尚未接入；回退方式是打开 App 即看到待打卡任务。",
+                                "App 打开时到点弹窗提醒并振动；错过时间的话，下次打开会补提醒。"
+                                "彻底退出后的系统通知需要 Android 原生插件，当前版本尚未支持。",
                                 size=10.5,
                                 color=p.muted,
                                 expand=True,

@@ -43,6 +43,12 @@ class App:
 
         self.file_picker = ft.FilePicker()
         self.page.services.append(self.file_picker)
+        self.haptic = ft.HapticFeedback()
+        self.page.services.append(self.haptic)
+
+        self._reminder_fired: set[str] = set()
+        self._reminder_snoozed: dict[str, datetime] = {}
+        self._reminder_showing = False
 
         page.title = "打卡任务栏"
         page.padding = 0
@@ -62,27 +68,47 @@ class App:
             selected_index=0,
             bgcolor=self.palette.surface,
             indicator_color=tint(self.palette.gold, 0.16),
-            height=66,
             on_change=self._on_nav_change,
             destinations=self._destinations(),
         )
         shell = ft.Column([self.content, self.nav], spacing=0, expand=True)
-        self.shell = ft.Container(shell, width=self._shell_width())
+        self.shell = ft.Container(shell, expand=True)
         page.add(
-            ft.Row(
-                [self.shell],
-                alignment=ft.MainAxisAlignment.CENTER,
+            ft.SafeArea(
+                content=ft.Row(
+                    [self.shell],
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    expand=True,
+                ),
                 expand=True,
             )
         )
         page.on_resize = lambda e: self._sync_shell_width()
 
-    def _shell_width(self) -> int:
-        width = self.page.width or 430
+    def _shell_width(self) -> int | None:
+        """屏幕宽度未知时返回 None，让容器铺满，避免窄屏被固定宽度撑出屏幕。"""
+        width = self.page.width or 0
+        if width <= 0:
+            return None
         return int(min(width, MAX_WIDTH))
 
+    def _content_padding(self) -> ft.Padding:
+        width = self.page.width or 0
+        narrow = bool(width and width < 390)
+        side = 14 if narrow else 20
+        top = 16 if narrow else 22
+        return ft.Padding.only(left=side, right=side, top=top, bottom=8)
+
+    def _dialog_width(self) -> int:
+        """对话框内容宽度：随屏幕收窄，避免在手机上左右溢出。"""
+        width = self.page.width or 380
+        return max(220, min(320, int(width) - 96))
+
     def _sync_shell_width(self) -> None:
-        self.shell.width = self._shell_width()
+        width = self._shell_width()
+        self.shell.width = width
+        self.shell.expand = width is None
+        self.content.padding = self._content_padding()
         self.page.update()
 
     # ------------------------------------------------------------ 基础渲染
@@ -113,11 +139,13 @@ class App:
         else:
             view = views_settings.build_settings(self)
         self.content.content = view
-        self.content.padding = ft.Padding.only(left=20, right=20, top=22, bottom=6)
+        self.content.padding = self._content_padding()
         self.nav.selected_index = self.tab
         self.nav.bgcolor = p.surface
         self.nav.indicator_color = tint(p.gold, 0.16)
-        self.shell.width = self._shell_width()
+        width = self._shell_width()
+        self.shell.width = width
+        self.shell.expand = width is None
         self.page.update()
 
     def _material_theme(self, p: Palette) -> ft.Theme:
@@ -205,24 +233,21 @@ class App:
             color = status_color(p, status)
             selected = bool(existing and existing["status"] == status)
             return ft.Container(
-                content=ft.Row(
+                content=ft.Column(
                     [
                         status_glyph(status, p, 22, show_tooltip=False),
-                        ft.Column(
-                            [
-                                ft.Text(STATUS_LABEL[status], size=13,
-                                        weight=ft.FontWeight.W_600,
-                                        color=status_text_color(p, status)),
-                                ft.Text(STATUS_DESC[status], size=10, color=p.faint),
-                            ],
-                            spacing=1,
-                            tight=True,
-                        ),
+                        ft.Text(STATUS_LABEL[status], size=13,
+                                weight=ft.FontWeight.W_600, max_lines=1,
+                                color=status_text_color(p, status)),
+                        ft.Text(STATUS_DESC[status], size=10, color=p.faint,
+                                max_lines=1, overflow=ft.TextOverflow.ELLIPSIS,
+                                text_align=ft.TextAlign.CENTER),
                     ],
-                    spacing=8,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=3,
+                    tight=True,
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
-                padding=ft.Padding.symmetric(horizontal=10, vertical=12),
+                padding=ft.Padding.symmetric(horizontal=6, vertical=10),
                 border_radius=14,
                 bgcolor=tint(color, 0.10 if selected else 0.04),
                 border=ft.Border.all(1.6 if selected else 1, tint(color, 0.55 if selected else 0.25)),
@@ -263,7 +288,7 @@ class App:
                 spacing=2,
                 tight=True,
             ),
-            content=ft.Container(body, width=300),
+            content=ft.Container(body, width=self._dialog_width()),
             actions=actions,
             actions_alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
         )
@@ -333,7 +358,7 @@ class App:
             content=ft.Container(
                 ft.Column(rows, spacing=6, tight=True,
                           scroll=ft.ScrollMode.AUTO, height=min(320, 54 * len(rows) + 8)),
-                width=300,
+                width=self._dialog_width(),
             ),
             actions=[ft.TextButton("关闭", on_click=lambda e: self.page.pop_dialog())],
         )
@@ -350,11 +375,12 @@ class App:
         )
         type_sel = ft.SegmentedButton(
             segments=[
-                ft.Segment(value="normal", label=ft.Text("普通任务")),
-                ft.Segment(value="special", label=ft.Text("特殊任务")),
+                ft.Segment(value="normal", label=ft.Text("普通任务", no_wrap=True)),
+                ft.Segment(value="special", label=ft.Text("特殊任务", no_wrap=True)),
             ],
             selected=[task["type"] if task else "normal"],
             allow_empty_selection=False,
+            expand=True,
             on_change=lambda e: on_type_change(),
         )
         deadline_field = ft.TextField(
@@ -362,11 +388,46 @@ class App:
             border_color=p.line, focused_border_color=p.gold,
             value=(task.get("deadline") or "") if task else "", visible=is_special,
         )
-        reminder_field = ft.TextField(
-            label="提醒时间", hint_text="21:00（留空不提醒）", text_size=13,
-            border_radius=12, border_color=p.line, focused_border_color=p.gold,
-            value=(task.get("reminder_time") or "") if task else "",
+        reminder_state = {"time": (task.get("reminder_time") or "") if task else ""}
+        reminder_value = ft.Text(
+            reminder_state["time"] or "未设置",
+            size=13,
+            weight=ft.FontWeight.W_600,
+            color=p.text if reminder_state["time"] else p.faint,
         )
+        reminder_box = ft.Container(
+            content=ft.Row(
+                [
+                    ft.Icon(ft.Icons.NOTIFICATIONS_NONE, size=16, color=p.muted),
+                    ft.Text("提醒时间", size=12, color=p.muted),
+                    ft.Container(expand=True),
+                    reminder_value,
+                    ft.Icon(ft.Icons.KEYBOARD_ARROW_DOWN, size=16, color=p.faint),
+                ],
+                spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            padding=ft.Padding.symmetric(horizontal=12, vertical=12),
+            border_radius=12,
+            border=ft.Border.all(1, p.line),
+            bgcolor=p.surface_soft,
+            on_click=lambda e: pick_reminder_time(),
+        )
+
+        def pick_reminder_time() -> None:
+            def apply(value: str) -> None:
+                reminder_state["time"] = value
+                reminder_value.value = value or "未设置"
+                reminder_value.color = p.text if value else p.faint
+                self.page.update()
+
+            self.pick_time(
+                reminder_state["time"] or "21:00",
+                "选择提醒时间",
+                apply,
+                allow_clear=bool(reminder_state["time"]),
+            )
+
         repeat_dd = ft.Dropdown(
             label="重复",
             value=(task.get("reminder_repeat") or "daily") if task else "daily",
@@ -402,12 +463,9 @@ class App:
                         parse_date(deadline)
                     except ValueError:
                         raise ValueError("截止日期格式应为 YYYY-MM-DD") from None
-                rtime = (reminder_field.value or "").strip() or None
-                if rtime:
-                    try:
-                        datetime.strptime(rtime, "%H:%M")
-                    except ValueError:
-                        raise ValueError("提醒时间格式应为 HH:MM") from None
+                rtime = reminder_state["time"] or None
+                if reminder_switch.value and not rtime:
+                    raise ValueError("开启提醒时需要先选择提醒时间")
 
                 if task:
                     self.db.update_task(task["id"], name=name, type=type_, deadline=deadline)
@@ -433,9 +491,9 @@ class App:
                 ft.Column(
                     [
                         name_field,
-                        type_sel,
+                        ft.Row([type_sel], spacing=0),
                         deadline_field,
-                        reminder_field,
+                        reminder_box,
                         repeat_dd,
                         reminder_switch,
                     ],
@@ -443,7 +501,8 @@ class App:
                     tight=True,
                     scroll=ft.ScrollMode.AUTO,
                 ),
-                width=300,
+                width=self._dialog_width(),
+                height=max(240, min(400, int((self.page.height or 760) * 0.55))),
             ),
             actions=[
                 ft.TextButton("取消", on_click=lambda e: self.page.pop_dialog()),
@@ -492,18 +551,8 @@ class App:
 
     def toggle_summary(self, enabled: bool) -> None:
         self.db.set_setting("summary_enabled", "1" if enabled else "0")
-        toast(self.page, "已开启每日汇总（系统通知待接入）" if enabled else "已关闭每日汇总")
+        toast(self.page, "已开启每日汇总提醒" if enabled else "已关闭每日汇总提醒")
         self.render()
-
-    def set_summary_time(self, value: str) -> None:
-        value = (value or "").strip()
-        try:
-            datetime.strptime(value, "%H:%M")
-        except ValueError:
-            toast(self.page, "时间格式应为 HH:MM")
-            return
-        self.db.set_setting("summary_time", value)
-        toast(self.page, f"汇总时间已保存为 {value}")
 
     def confirm_clear(self) -> None:
         p = self.palette
@@ -608,6 +657,317 @@ class App:
             )
         )
 
+    # ------------------------------------------------------------ 时间选择
+    def pick_time(self, initial: str, title: str, on_confirm, allow_clear: bool = False) -> None:
+        """滑动滚轮选择时间，替代手动输入 HH:MM。"""
+        p = self.palette
+        try:
+            hh, mm = (int(x) for x in initial.split(":")[:2])
+            hh, mm = hh % 24, mm % 60
+        except Exception:
+            hh, mm = 21, 0
+
+        state = {"h": hh, "m": mm}
+        hour_picker = ft.CupertinoPicker(
+            controls=[ft.Text(f"{h:02d}", size=20, color=p.text) for h in range(24)],
+            selected_index=hh,
+            item_extent=36,
+            width=68,
+            height=168,
+            use_magnifier=True,
+            looping=True,
+            default_selection_overlay_bgcolor=tint(p.gold, 0.14),
+            on_change=lambda e: state.__setitem__("h", int(e.control.selected_index)),
+        )
+        minute_picker = ft.CupertinoPicker(
+            controls=[ft.Text(f"{m:02d}", size=20, color=p.text) for m in range(60)],
+            selected_index=mm,
+            item_extent=36,
+            width=68,
+            height=168,
+            use_magnifier=True,
+            looping=True,
+            default_selection_overlay_bgcolor=tint(p.gold, 0.14),
+            on_change=lambda e: state.__setitem__("m", int(e.control.selected_index)),
+        )
+
+        def confirm(e) -> None:
+            self.page.pop_dialog()
+            on_confirm(f"{state['h']:02d}:{state['m']:02d}")
+
+        def clear(e) -> None:
+            self.page.pop_dialog()
+            on_confirm("")
+
+        actions: list[ft.Control] = []
+        if allow_clear:
+            actions.append(ft.TextButton("清除", on_click=clear))
+        actions.append(ft.TextButton("取消", on_click=lambda e: self.page.pop_dialog()))
+        actions.append(ft.FilledButton("确定", on_click=confirm))
+
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                bgcolor=p.surface,
+                title=ft.Text(title, size=16, weight=ft.FontWeight.W_600, color=p.text),
+                content=ft.Container(
+                    ft.Row(
+                        [
+                            hour_picker,
+                            ft.Text("时", size=12, color=p.muted),
+                            minute_picker,
+                            ft.Text("分", size=12, color=p.muted),
+                        ],
+                        spacing=4,
+                        alignment=ft.MainAxisAlignment.CENTER,
+                    ),
+                    width=self._dialog_width(),
+                    height=184,
+                    alignment=ft.Alignment.CENTER,
+                ),
+                actions=actions,
+                actions_alignment=ft.MainAxisAlignment.END,
+            )
+        )
+
+    def pick_summary_time(self) -> None:
+        current = self.db.get_setting("summary_time", "21:00") or "21:00"
+
+        def apply(value: str) -> None:
+            if not value:
+                return
+            self.db.set_setting("summary_time", value)
+            toast(self.page, f"每日汇总时间已设为 {value}")
+            self.render()
+
+        self.pick_time(current, "每日汇总时间", apply)
+
+    # ------------------------------------------------------------ 到点提醒
+    def _reminder_key(self, kind: str, ident: str = "") -> str:
+        return f"{kind}:{ident}:{date.today().isoformat()}"
+
+    def _is_due(self, key: str, scheduled: datetime, now: datetime) -> bool:
+        if key in self._reminder_fired:
+            return False
+        snooze_until = self._reminder_snoozed.get(key)
+        if snooze_until is not None:
+            return now >= snooze_until
+        # 当天错过整分钟（切后台、刚打开 App）时，打开后补一次提醒
+        return now >= scheduled
+
+    def _dialog_busy(self) -> bool:
+        if self._reminder_showing:
+            return True
+        try:
+            return bool(self.page._dialogs.controls)
+        except Exception:
+            return False
+
+    def _due_task_reminders(self, now: datetime) -> list[tuple[dict, str]]:
+        today = date.today()
+        checkins = self.db.day_checkins(today)
+        due: list[tuple[dict, str]] = []
+        for t in self.db.list_tasks():
+            rtime = t.get("reminder_time")
+            if not t.get("reminder_enabled") or not rtime:
+                continue
+            try:
+                hh, mm = (int(x) for x in str(rtime).split(":")[:2])
+                scheduled = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            except Exception:
+                continue
+            if t["id"] in checkins:
+                continue
+            key = f"task:{t['id']}:{today.isoformat()}:{rtime}"
+            if self._is_due(key, scheduled, now):
+                due.append((t, key))
+        return due
+
+    def _due_summary(self, now: datetime) -> list[dict] | None:
+        if str(self.db.get_setting("summary_enabled", "0")) != "1":
+            return None
+        rtime = self.db.get_setting("summary_time", "21:00") or "21:00"
+        try:
+            hh, mm = (int(x) for x in str(rtime).split(":")[:2])
+            scheduled = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        except Exception:
+            return None
+        key = self._reminder_key("summary", str(rtime))
+        if not self._is_due(key, scheduled, now):
+            return None
+        checkins = self.db.day_checkins(date.today())
+        pending = [t for t in self.db.list_tasks() if t["id"] not in checkins]
+        self._reminder_fired.add(key)
+        return pending
+
+    def _disable_once_reminders(self, due: list[tuple[dict, str]]) -> None:
+        for t, _ in due:
+            if (t.get("reminder_repeat") or "daily") == "once" and t.get("reminder_enabled"):
+                self.db.set_reminder(t["id"], t.get("reminder_time"), "once", False)
+
+    async def _show_task_reminder(self, due: list[tuple[dict, str]], now: datetime) -> None:
+        self._reminder_showing = True
+        for _, key in due:
+            self._reminder_fired.add(key)
+            self._reminder_snoozed.pop(key, None)
+        try:
+            await self.haptic.vibrate()
+        except Exception:
+            pass
+
+        p = self.palette
+        rows: list[ft.Control] = []
+        for t, _ in due[:4]:
+            rows.append(
+                ft.Row(
+                    [
+                        ft.Container(width=5, height=5, border_radius=3,
+                                     bgcolor=tint(p.gold, 0.9)),
+                        ft.Text(t["name"], size=13, color=p.text, max_lines=1,
+                                overflow=ft.TextOverflow.ELLIPSIS, expand=True),
+                        ft.Text(t.get("reminder_time") or "", size=11, color=p.muted),
+                    ],
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                )
+            )
+        if len(due) > 4:
+            rows.append(ft.Text(f"还有 {len(due) - 4} 个任务…", size=11, color=p.muted))
+
+        def snooze(e) -> None:
+            for _, key in due:
+                self._reminder_fired.discard(key)
+                self._reminder_snoozed[key] = now + timedelta(minutes=10)
+            self._reminder_showing = False
+            self.page.pop_dialog()
+            toast(self.page, "10 分钟后再提醒你")
+
+        def dismiss(e) -> None:
+            self._reminder_showing = False
+            self.page.pop_dialog()
+            self._disable_once_reminders(due)
+
+        def go(e) -> None:
+            self._reminder_showing = False
+            self.page.pop_dialog()
+            self._disable_once_reminders(due)
+            self.open_checkin(due[0][0], date.today())
+
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                bgcolor=p.surface,
+                title=ft.Column(
+                    [
+                        ft.Text("该打卡了", size=17, weight=ft.FontWeight.W_600, color=p.text),
+                        ft.Text(f"{now.strftime('%H:%M')} · 今天还没有记录", size=11, color=p.muted),
+                    ],
+                    spacing=2,
+                    tight=True,
+                ),
+                content=ft.Container(
+                    ft.Column(
+                        rows + [ft.Text("记下之后，今天就不会再提醒。", size=10, color=p.faint)],
+                        spacing=8,
+                        tight=True,
+                    ),
+                    width=self._dialog_width(),
+                ),
+                actions=[
+                    ft.TextButton("稍后提醒", on_click=snooze),
+                    ft.TextButton("知道了", on_click=dismiss),
+                    ft.FilledButton("去打卡", on_click=go),
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+            )
+        )
+
+    async def _show_summary_reminder(self, pending: list[dict], now: datetime) -> None:
+        if not pending:
+            return
+        self._reminder_showing = True
+        try:
+            await self.haptic.vibrate()
+        except Exception:
+            pass
+
+        p = self.palette
+        key = self._reminder_key(
+            "summary", str(self.db.get_setting("summary_time", "21:00") or "21:00")
+        )
+
+        def snooze(e) -> None:
+            self._reminder_fired.discard(key)
+            self._reminder_snoozed[key] = now + timedelta(minutes=10)
+            self._reminder_showing = False
+            self.page.pop_dialog()
+            toast(self.page, "10 分钟后再提醒你")
+
+        def dismiss(e) -> None:
+            self._reminder_showing = False
+            self.page.pop_dialog()
+
+        def go(e) -> None:
+            self._reminder_showing = False
+            self.page.pop_dialog()
+            self.tab = 0
+            self.render()
+
+        names = "、".join(t["name"] for t in pending[:4])
+        if len(pending) > 4:
+            names += f" 等 {len(pending)} 个任务"
+
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                bgcolor=p.surface,
+                title=ft.Column(
+                    [
+                        ft.Text("今天还没收尾", size=17, weight=ft.FontWeight.W_600, color=p.text),
+                        ft.Text(f"{now.strftime('%H:%M')} · 每日汇总", size=11, color=p.muted),
+                    ],
+                    spacing=2,
+                    tight=True,
+                ),
+                content=ft.Container(
+                    ft.Column(
+                        [
+                            ft.Text(f"还有 {len(pending)} 个任务没有记录：", size=12, color=p.text),
+                            ft.Text(names, size=12, color=p.muted),
+                            ft.Text("现在补上，或者明早在回顾里补记。", size=10, color=p.faint),
+                        ],
+                        spacing=8,
+                        tight=True,
+                    ),
+                    width=self._dialog_width(),
+                ),
+                actions=[
+                    ft.TextButton("稍后提醒", on_click=snooze),
+                    ft.TextButton("知道了", on_click=dismiss),
+                    ft.FilledButton("去记录", on_click=go),
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+            )
+        )
+
+    async def reminder_loop(self) -> None:
+        """App 运行期间每 15 秒检查一次到点提醒。"""
+        while True:
+            await asyncio.sleep(15)
+            try:
+                if self._dialog_busy():
+                    continue
+                now = datetime.now()
+                due = self._due_task_reminders(now)
+                if due:
+                    await self._show_task_reminder(due, now)
+                    continue
+                pending = self._due_summary(now)
+                if pending is not None:
+                    await self._show_summary_reminder(pending, now)
+            except Exception:
+                pass
+
     # ------------------------------------------------------------ 时钟
     async def clock_loop(self) -> None:
         while True:
@@ -623,6 +983,7 @@ class App:
 def main(page: ft.Page) -> None:
     app = App(page)
     page.run_task(app.clock_loop)
+    page.run_task(app.reminder_loop)
     app.render()
 
 
