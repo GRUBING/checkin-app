@@ -296,34 +296,64 @@ class DB:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def month_map(self, year: int, month: int) -> dict[str, dict]:
+    def month_map(self, year: int, month: int, task_id: int | None = None) -> dict[str, dict]:
+        """按月聚合每天的状态构成；task_id 为 None 时统计全部任务。
+
+        每个 bucket：status（当天最差状态）、count（记录条数）、backfill（补记条数）、
+        parts（各状态的任务数）、total（当天应打卡的任务数）。
+        """
         start = date(year, month, 1)
         end = date(year, month, calendar.monthrange(year, month)[1])
-        buckets: dict[str, dict] = {}
-        for row in self.checkins_between(start, end):
-            b = buckets.setdefault(row["date"], {"status": row["status"], "count": 0, "backfill": 0})
-            b["count"] += 1
-            b["backfill"] += 1 if row["is_backfill"] else 0
-            if SEVERITY[row["status"]] > SEVERITY[b["status"]]:
-                b["status"] = row["status"]
-
-        # 无记录的日子：今天为 pending，过去为 missed；任务创建之前的日期留白。
-        tasks = self.list_tasks()
+        tasks = self.list_tasks(include_archived=True)
+        if task_id is not None:
+            tasks = [t for t in tasks if t["id"] == task_id]
         if not tasks:
-            return buckets
+            return {}
+
+        index: dict[tuple[int, str], dict] = {}
+        for row in self.checkins_between(start, end):
+            index[(int(row["task_id"]), row["date"])] = row
+
         today_date = today()
-        first_created = min(parse_date(t["created_at"]) for t in tasks)
-        day = max(start, first_created)
+        buckets: dict[str, dict] = {}
+        day = start
         while day <= min(end, today_date):
             key = iso(day)
-            if key not in buckets:
+            parts: dict[str, int] = {}
+            records = backfill = applicable = 0
+            worst: str | None = None
+            for t in tasks:
+                row = index.get((int(t["id"]), key))
+                if row:
+                    st = row["status"]
+                    parts[st] = parts.get(st, 0) + 1
+                    records += 1
+                    backfill += 1 if row["is_backfill"] else 0
+                    if worst is None or SEVERITY[st] > SEVERITY[worst]:
+                        worst = st
+                elif t["archived"] or day < parse_date(t["created_at"]):
+                    continue
+                else:
+                    st = "pending" if day == today_date else "missed"
+                    parts[st] = parts.get(st, 0) + 1
+                    applicable += 1
+            if records or applicable:
                 buckets[key] = {
-                    "status": "pending" if day == today_date else "missed",
-                    "count": 0,
-                    "backfill": 0,
+                    "status": worst or ("pending" if parts.get("pending") else "missed"),
+                    "count": records,
+                    "backfill": backfill,
+                    "parts": parts,
+                    "total": records + applicable,
                 }
             day += timedelta(days=1)
         return buckets
+
+    def status_by_task_day(self, start: date, end: date) -> dict[int, dict[str, dict]]:
+        """按 任务 -> 日期 索引某段时间的记录，用于多任务柱状图。"""
+        result: dict[int, dict[str, dict]] = {}
+        for row in self.checkins_between(start, end):
+            result.setdefault(int(row["task_id"]), {})[row["date"]] = dict(row)
+        return result
 
     # ------------------------------------------------------------------ 统计
     def task_stats(self, task_id: int, days: int = 30) -> dict:
@@ -354,11 +384,7 @@ class DB:
         records = missed = special = backfill = 0
         recorded_days: set[str] = set()
         for t in self.list_tasks(include_archived=True):
-            created = parse_date(t["created_at"])
-            from_day = max(start, created)
-            if from_day > end:
-                continue
-            rows = self.task_checkins(t["id"], from_day, end)
+            rows = self.task_checkins(t["id"], start, end)
             for r in rows:
                 counts[r["status"]] += 1
                 records += 1
@@ -367,7 +393,7 @@ class DB:
                 if t["type"] == "special":
                     special += 1
             if not t["archived"]:
-                day = from_day
+                day = max(start, parse_date(t["created_at"]))
                 while day <= end and day < today():
                     if not self.get_checkin(t["id"], day):
                         missed += 1
@@ -378,6 +404,41 @@ class DB:
             "missed": missed,
             "streak": self._longest_streak(recorded_days),
             "special": special,
+            "backfill": backfill,
+            "days": (end - start).days + 1,
+        }
+
+    def task_period_summary(self, task_id: int, start: date, end: date) -> dict:
+        """单个任务在某段时间内的统计，字段与 period_summary 保持一致。"""
+        empty = {"records": 0, "counts": {s: 0 for s in STATUSES}, "missed": 0,
+                 "streak": 0, "special": 0, "backfill": 0, "days": 0}
+        t = self.get_task(task_id)
+        if not t:
+            return empty
+        end = min(end, today())
+        if start > end:
+            return empty
+        rows = self.task_checkins(task_id, start, end)
+        counts = {s: 0 for s in STATUSES}
+        recorded_days: set[str] = set()
+        backfill = 0
+        for r in rows:
+            counts[r["status"]] += 1
+            recorded_days.add(r["date"])
+            backfill += 1 if r["is_backfill"] else 0
+        missed = 0
+        if not t["archived"]:
+            day = max(start, parse_date(t["created_at"]))
+            while day <= end and day < today():
+                if not self.get_checkin(task_id, day):
+                    missed += 1
+                day += timedelta(days=1)
+        return {
+            "records": len(rows),
+            "counts": counts,
+            "missed": missed,
+            "streak": self._longest_streak(recorded_days),
+            "special": 0,
             "backfill": backfill,
             "days": (end - start).days + 1,
         }

@@ -36,7 +36,8 @@ class App:
         self.db = DB()
         self.tab = 0
         self.review_month = date.today().replace(day=1)
-        self.timeline_task_id: int | None = None
+        self.timeline_task_id: int | str = "all"
+        self.review_name_tasks: set[int] = set()
         self.clock_text: ft.Text | None = None
         self.theme_mode = self.db.get_setting("theme_mode", "light") or "light"
         self.palette = palette_for(self._is_dark())
@@ -183,8 +184,16 @@ class App:
         self.review_month = date(year, month, 1)
         self.render()
 
-    def set_timeline_task(self, task_id: int) -> None:
-        self.timeline_task_id = task_id
+    def set_timeline_task(self, task_id) -> None:
+        self.timeline_task_id = "all" if task_id == "all" else int(task_id)
+        self.render()
+
+    def toggle_task_label(self, task_id: int) -> None:
+        """柱状图纵轴的“任务1 / 任务2”点击后显示具体任务名称。"""
+        if task_id in self.review_name_tasks:
+            self.review_name_tasks.discard(task_id)
+        else:
+            self.review_name_tasks.add(task_id)
         self.render()
 
     # ------------------------------------------------------------ 打卡
@@ -560,7 +569,7 @@ class App:
         def do_clear(e) -> None:
             self.db.clear_all()
             self.page.pop_dialog()
-            self.timeline_task_id = None
+            self.timeline_task_id = "all"
             toast(self.page, "全部数据已清空")
             self.render()
 
@@ -626,7 +635,7 @@ class App:
                 toast(self.page, str(ex))
                 return
             self.page.pop_dialog()
-            self.timeline_task_id = None
+            self.timeline_task_id = "all"
             toast(self.page, "已导入备份")
             self.render()
 

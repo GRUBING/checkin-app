@@ -32,9 +32,21 @@ def status_glyph(status: str, p: Palette, size: int = 26, backfill: bool = False
             )
         glyph: ft.Control = ft.Stack(parts, width=size, height=size, alignment=ft.Alignment.CENTER)
     else:
+        dot = ft.Container(
+            width=size,
+            height=size,
+            border_radius=size / 2,
+            bgcolor=color,
+            shadow=(
+                ft.BoxShadow(blur_radius=size * 0.5, spread_radius=0,
+                             color=tint(color, 0.55))
+                if status == "perfect"
+                else None
+            ),
+        )
         glyph = ft.Stack(
             [
-                ft.Container(width=size, height=size, border_radius=size / 2, bgcolor=color),
+                dot,
                 ft.Icon(STATUS_ICON[status], size=size * 0.6, color="#FFFFFF"),
             ],
             width=size,
